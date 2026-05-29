@@ -68,7 +68,7 @@ python -m src.gui
 1. Click **New Project** — enter a name and choose where to save it.
 2. Click **Import Video** — pick a file and optionally set a display name.
 3. Imported clips appear in the table with frame count, FPS, and flag count.
-4. Select a clip to preview it — use **Play/Pause**, **Stop**, and the frame scrubber.
+4. Select a clip to preview it — use **Play/Pause**, **Stop**, and the frame scrubber (audio plays during playback when ffpyplayer is installed).
 5. Select a clip → **Add Flag** (`Ctrl+F`) to mark frames while scrubbing in the preview.
 6. Select a clip → **Crop Between Flags** (`Ctrl+K`) to create a trimmed copy.
 
@@ -258,7 +258,8 @@ python -m src.gui
 | Package | Purpose |
 |---------|---------|
 | [Pydantic v2](https://docs.pydantic.dev/) | Data validation and JSON serialization |
-| [OpenCV](https://opencv.org/) (headless) | Video metadata probing and thumbnail extraction |
+| [OpenCV](https://opencv.org/) (headless) | Video metadata probing, thumbnails, and frame-accurate scrubbing |
+| [ffpyplayer](https://github.com/matham/ffpyplayer) | Synced audio/video during preview playback |
 
 OpenCV is optional at runtime for metadata/thumbnails — the service falls back to safe defaults if OpenCV is unavailable, but you should install it for normal use.
 

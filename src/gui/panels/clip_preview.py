@@ -11,6 +11,7 @@ from typing import Callable, Optional
 from src.api.errors import ProjectServiceError
 from src.api.project_service import ProjectService
 from src.api.video import normalize_fps
+from src.gui.media import MediaPlayback, playback_available
 from src.gui.theme import Colors, Fonts, Spacing
 
 
@@ -39,6 +40,8 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._scrubbing = False
         self._last_frame_bgr = None
         self._resize_after_id: Optional[str] = None
+        self._media = MediaPlayback()
+        self._audio_enabled = playback_available()
 
         self._clip_name_var = tk.StringVar(value="No clip selected")
         self._frame_entry_var = tk.StringVar(value="1")
@@ -128,6 +131,7 @@ class ClipPreviewPanel(ttk.LabelFrame):
     def clear(self) -> None:
         """Stop playback and reset the panel."""
         self.stop_playback()
+        self._media.close()
         self._release_capture()
         self._clip_id = None
         self._video_path = None
@@ -247,25 +251,87 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._pause()
 
     def _play(self) -> None:
-        if self._capture is None or self._frame_count <= 0:
+        if self._capture is None or self._frame_count <= 0 or self._video_path is None:
             return
         if self._current_frame >= self._frame_count - 1:
             self._show_frame(0)
 
+        if self._audio_enabled:
+            start_time = self._current_frame / self._fps
+            try:
+                self._media.open(self._video_path, start_time)
+            except Exception:
+                self._audio_enabled = False
+                if self._on_status:
+                    self._on_status("Audio preview unavailable — playing video only.")
+                self._play_with_opencv()
+                return
+
+            self._playing = True
+            self._play_btn.configure(text="Pause")
+            self._playback_tick_media()
+            return
+
+        self._play_with_opencv()
+
+    def _play_with_opencv(self) -> None:
+        """Fallback playback without audio."""
         self._playing = True
         self._play_btn.configure(text="Pause")
         frame_interval = 1.0 / self._fps
         self._next_frame_deadline = time.perf_counter() + frame_interval
-        self._playback_tick()
+        self._playback_tick_opencv()
 
     def _pause(self) -> None:
+        was_playing = self._playing
         self._playing = False
         self._play_btn.configure(text="Play")
         if self._after_id is not None:
             self.after_cancel(self._after_id)
             self._after_id = None
+        self._media.close()
+        if was_playing and self._capture is not None:
+            self._show_frame(self._current_frame)
 
-    def _playback_tick(self) -> None:
+    def _playback_tick_media(self) -> None:
+        """Advance playback with synced audio via ffpyplayer."""
+        if not self._playing or not self._media.is_open:
+            return
+
+        rgb, pts, status, delay = self._media.poll()
+        if status == "eof":
+            self._pause()
+            return
+
+        if status == "frame" and rgb is not None:
+            wait_ms = max(0, int(delay * 1000 + 0.5))
+            if wait_ms > 0:
+                self._after_id = self.after(
+                    wait_ms,
+                    lambda frame=rgb, presentation_time=pts: self._show_media_frame(
+                        frame, presentation_time
+                    ),
+                )
+                return
+            self._show_media_frame(rgb, pts)
+            return
+
+        wait_ms = max(1, int(delay * 1000 + 0.5)) if delay > 0 else 10
+        self._after_id = self.after(wait_ms, self._playback_tick_media)
+
+    def _show_media_frame(self, rgb, pts: float) -> None:
+        """Display one ffpyplayer frame, then request the next."""
+        if not self._playing or not self._media.is_open:
+            return
+
+        self._current_frame = min(int(pts * self._fps), self._frame_count - 1)
+        self._render_rgb(rgb)
+        if not self._scrubbing:
+            self._scrubber.set(self._current_frame)
+        self._sync_frame_entry(self._current_frame + 1)
+        self._playback_tick_media()
+
+    def _playback_tick_opencv(self) -> None:
         """Advance playback using wall-clock timing at the clip's frame rate."""
         if not self._playing or self._capture is None:
             return
@@ -288,7 +354,7 @@ class ClipPreviewPanel(ttk.LabelFrame):
                 self._next_frame_deadline = now + frame_interval
 
         wait_ms = max(1, int((self._next_frame_deadline - time.perf_counter()) * 1000))
-        self._after_id = self.after(wait_ms, self._playback_tick)
+        self._after_id = self.after(wait_ms, self._playback_tick_opencv)
 
     def _advance_frame_sequential(self) -> bool:
         """Read and display the next frame without seeking (fast path for playback)."""
@@ -300,7 +366,7 @@ class ClipPreviewPanel(ttk.LabelFrame):
             return False
 
         self._current_frame += 1
-        self._render_frame(frame)
+        self._render_frame_bgr(frame)
         if not self._scrubbing:
             self._scrubber.set(self._current_frame)
         self._sync_frame_entry(self._current_frame + 1)
@@ -320,7 +386,7 @@ class ClipPreviewPanel(ttk.LabelFrame):
             return
 
         self._current_frame = frame_index
-        self._render_frame(frame)
+        self._render_frame_bgr(frame)
         if not self._scrubbing:
             self._scrubber.set(frame_index)
         self._sync_frame_entry(frame_index + 1)
@@ -357,13 +423,15 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._frame_entry_var.set(str(display_frame))
         self._syncing_entry = False
 
-    def _render_frame(self, frame_bgr) -> None:
+    def _render_frame_bgr(self, frame_bgr) -> None:
         import cv2  # type: ignore[import-untyped]
 
         self._last_frame_bgr = frame_bgr
+        self._render_rgb(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+
+    def _render_rgb(self, rgb) -> None:
         canvas_w, canvas_h = self._canvas_size()
 
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
         if width <= 0 or height <= 0:
             return
@@ -372,6 +440,8 @@ class ClipPreviewPanel(ttk.LabelFrame):
         target_w = max(int(width * scale), 1)
         target_h = max(int(height * scale), 1)
         if target_w != width or target_h != height:
+            import cv2  # type: ignore[import-untyped]
+
             interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
             rgb = cv2.resize(rgb, (target_w, target_h), interpolation=interpolation)
 
