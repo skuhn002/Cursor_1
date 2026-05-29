@@ -97,6 +97,12 @@ def _cmd_info(args: argparse.Namespace) -> int:
     print(f"Clip: {clip.display_name} ({clip.id})")
     print(f"Resource: {resource.display_name} ({resource.id})")
     print(f"File: {resource.original_filename}")
+    if clip.version_filename:
+        print(f"Version: {clip.version_filename}")
+    if clip.trim_start_frame is not None and clip.trim_end_frame is not None:
+        print(f"Trim: frames {clip.trim_start_frame}–{clip.trim_end_frame}")
+    if clip.source_clip_id:
+        print(f"Source clip: {clip.source_clip_id}")
     print(f"Frames: {resource.duration_frames} @ {resource.fps:.2f} fps")
     print(f"Resolution: {resource.width}x{resource.height}")
     print(f"Flags: {len(flags)}")
@@ -107,6 +113,23 @@ def _cmd_info(args: argparse.Namespace) -> int:
             print(line)
             if flag.note:
                 print(f"           note: {flag.note}")
+    return 0
+
+
+def _cmd_crop(args: argparse.Namespace) -> int:
+    service = _get_service(
+        Path(args.project).resolve() if args.project else None
+    )
+    cropped = service.crop_clip(
+        clip_id=args.clip_id,
+        start_flag_id=args.start_flag_id,
+        end_flag_id=args.end_flag_id,
+        display_name=args.display_name,
+    )
+    print(f"Cropped clip: {cropped.display_name}")
+    print(f"Clip ID: {cropped.id}")
+    print(f"Frames: {cropped.trim_start_frame}–{cropped.trim_end_frame}")
+    print(f"Version: {cropped.version_filename}")
     return 0
 
 
@@ -164,6 +187,21 @@ def _build_parser() -> argparse.ArgumentParser:
     info_p = sub.add_parser("info", help="Show details for a clip")
     info_p.add_argument("clip_id", help="Clip ID to inspect")
     info_p.set_defaults(func=_cmd_info)
+
+    crop_p = sub.add_parser(
+        "crop",
+        help="Crop a clip between two flags (creates a new clip)",
+    )
+    crop_p.add_argument("clip_id", help="Source clip ID")
+    crop_p.add_argument("start_flag_id", help="Start flag ID (inclusive)")
+    crop_p.add_argument("end_flag_id", help="End flag ID (inclusive)")
+    crop_p.add_argument(
+        "--name",
+        dest="display_name",
+        default=None,
+        help="Optional display name for the cropped clip",
+    )
+    crop_p.set_defaults(func=_cmd_crop)
 
     return parser
 

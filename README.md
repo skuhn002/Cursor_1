@@ -2,7 +2,7 @@
 
 A lightweight, **flag-driven** video editor. Moment organizes work around projects, imported video clips, and frame-based **flags** (annotations you place on specific frames).
 
-This is an early MVP: project management, video import, and flag storage are in place. Timeline editing and playback UI are planned next.
+This is an early MVP: project management, video import, flag-based cropping, and in-GUI clip preview are in place.
 
 ---
 
@@ -11,8 +11,10 @@ This is an early MVP: project management, video import, and flag storage are in 
 - **Project folders** — self-contained `.clip` bundles with metadata and media
 - **Video import** — copies originals, probes metadata, generates poster thumbnails
 - **Frame-based flags** — mark exact frames with notes, colors, and types
+- **Flag-driven cropping** — trim a clip to the range between two flags (creates a new clip)
+- **Clip preview** — play back and scrub selected clips in the GUI
 - **CLI** — scriptable commands for automation and quick testing
-- **GUI** — simple desktop app for creating projects and importing video
+- **GUI** — desktop app for projects, import, flags, cropping, and preview
 
 ---
 
@@ -66,6 +68,9 @@ python -m src.gui
 1. Click **New Project** — enter a name and choose where to save it.
 2. Click **Import Video** — pick a file and optionally set a display name.
 3. Imported clips appear in the table with frame count, FPS, and flag count.
+4. Select a clip to preview it — use **Play/Pause**, **Stop**, and the frame scrubber.
+5. Select a clip → **Add Flag** (`Ctrl+F`) to mark frames while scrubbing in the preview.
+6. Select a clip → **Crop Between Flags** (`Ctrl+K`) to create a trimmed copy.
 
 The GUI remembers your last open project via `.moment.json` in the current working directory.
 
@@ -86,6 +91,9 @@ python -m src.cli addflag clip_abc123 245 "Add title here" --color "#EF4444" --t
 
 # Inspect a clip
 python -m src.cli info clip_abc123
+
+# Crop between two flags (creates a new clip)
+python -m src.cli crop clip_abc123 flag_start_id flag_end_id --name "Intro trimmed"
 ```
 
 Use `--project path\to\Project.clip` on any command to target a specific project instead of the active one.
@@ -102,7 +110,7 @@ My_Test_Project.clip/
 └── resources/
     └── video_a1b2c3d4/
         ├── original/     # copied source video
-        ├── versions/     # future edited outputs
+        ├── versions/     # cropped outputs (e.g. crop_120_480_*.mp4)
         └── thumbnails/   # poster.jpg
 ```
 
@@ -119,6 +127,74 @@ My_Test_Project.clip/
 | `addflag <clip_id> <frame> [note] [--color HEX] [--type TYPE]` | Add a flag to a clip |
 | `list` | List all clips in the active project |
 | `info <clip_id>` | Show clip details and flags |
+| `crop <clip_id> <start_flag_id> <end_flag_id> [--name NAME]` | Crop between two flags; creates a new clip |
+
+---
+
+## Flags and cropping
+
+Moment uses **frame numbers** as the primary timing unit. A **flag** is a marker on a specific frame of a clip — it can carry a note, color, and type (e.g. `general`, `title`). Flags are the main way to define edit points, especially for cropping.
+
+### Adding flags
+
+**CLI** — place a flag on a frame (use `info` to see flag IDs):
+
+```bash
+python -m src.cli addflag clip_abc123 0 "Opening shot"
+python -m src.cli addflag clip_abc123 245 "Title ends" --color "#EF4444" --type title
+python -m src.cli info clip_abc123
+```
+
+**GUI** — select a clip, scrub the preview to the frame you want, then **Clip → Add Flag…** (or **Add Flag** / `Ctrl+F`).
+
+### Cropping between flags
+
+Cropping extracts the **inclusive frame range** between a start flag and an end flag and writes a new video file. The **original clip is not modified** — Moment creates a **new clip** that points to the cropped file in `resources/.../versions/`.
+
+**How the range is resolved:**
+
+| Rule | Behavior |
+|------|----------|
+| Inclusive range | Both the start and end flag frames are included in the output |
+| Start/end of clip | A flag at frame `0` crops from the beginning; a flag at or past the last frame crops to the end |
+| Out-of-range flags | Flag frames are clamped to `0 … last frame` |
+| Reversed flags | If the start flag is after the end flag, their frames are swapped automatically |
+
+**CLI example:**
+
+```bash
+# Mark in and out points, then crop
+python -m src.cli addflag clip_abc123 120 "In"
+python -m src.cli addflag clip_abc123 480 "Out"
+python -m src.cli info clip_abc123          # copy flag IDs from output
+python -m src.cli crop clip_abc123 flag_in_id flag_out_id --name "Middle section"
+```
+
+**GUI** — select a clip → **Clip → Crop Between Flags…** (`Ctrl+K`). Choose a **start** and **end** from the dropdown. The list always includes:
+
+- **Start of clip (frame 0)**
+- **End of clip (last frame)**
+- Any flags you have added on that clip
+
+You can crop to the full clip, a segment between two custom flags, or from a flag to an edge (e.g. flag → end of clip) without placing a flag on frame 0 or the last frame.
+
+### What you get after a crop
+
+```
+resources/video_a1b2c3d4/
+├── original/intro.mp4              # untouched source
+└── versions/
+    └── crop_120_480_a1b2c3d4.mp4   # new trimmed file
+```
+
+The new clip appears in the project with trim metadata (`trim_start_frame`, `trim_end_frame`) and previews the version file, not the full original.
+
+### Typical workflow
+
+1. Import a video → creates a clip.
+2. Scrub the preview and add flags at the frames you care about.
+3. Crop between two flags (or between a flag and a clip edge).
+4. Preview the cropped clip in the GUI, or inspect it with `python -m src.cli info <clip_id>`.
 
 ---
 
@@ -189,9 +265,8 @@ Create test projects anywhere outside the repo, or in the repo root (they are gi
 
 ## Roadmap
 
-- [ ] Timeline / playback UI
-- [ ] Flag editing in the GUI
-- [ ] Clip trimming and version exports
+- [ ] Flag editing and deletion in the GUI
+- [ ] Timeline with flag markers overlaid on the scrubber
 - [ ] Plugin or script hooks for flag-driven automation
 
 ---

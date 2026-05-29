@@ -49,6 +49,10 @@ class Clip(BaseModel):
     resource_id: str
     display_name: str
     flags: list[Flag] = Field(default_factory=list)
+    source_clip_id: Optional[str] = None
+    version_filename: Optional[str] = None
+    trim_start_frame: Optional[int] = None
+    trim_end_frame: Optional[int] = None
     created_at: datetime = Field(default_factory=_utc_now)
 
 

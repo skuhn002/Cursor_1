@@ -23,6 +23,8 @@ class ProjectService:
     PROJECT_EXTENSION = ".clip"
     RESOURCES_DIR = "resources"
     PROJECT_JSON = "project.json"
+    EDGE_START_FLAG = "__moment_edge_start__"
+    EDGE_END_FLAG = "__moment_edge_end__"
 
     def __init__(self, project_path: Optional[Path] = None) -> None:
         self._project_path: Optional[Path] = (
@@ -240,6 +242,110 @@ class ProjectService:
         clip = self.get_clip(clip_id)
         return sorted(clip.flags, key=lambda f: f.frame)
 
+    def get_flag(self, clip_id: str, flag_id: str) -> Flag:
+        """Return a single flag by ID from a clip.
+
+        Raises:
+            ProjectServiceError: If the clip or flag is not found.
+        """
+        clip = self.get_clip(clip_id)
+        for flag in clip.flags:
+            if flag.id == flag_id:
+                return flag
+        raise ProjectServiceError(f"Flag not found: {flag_id}")
+
+    def crop_clip(
+        self,
+        clip_id: str,
+        start_flag_id: str,
+        end_flag_id: str,
+        display_name: Optional[str] = None,
+    ) -> Clip:
+        """Crop a clip to the frame range between two flags.
+
+        Flag frames are clamped to the clip edges (frame 0 and the last frame).
+        If the start flag is after the end flag, their frames are swapped.
+
+        Writes the cropped video to the resource ``versions/`` folder and
+        creates a new clip referencing that version.
+
+        Args:
+            clip_id: Source clip to crop from.
+            start_flag_id: Flag marking the crop start (inclusive).
+            end_flag_id: Flag marking the crop end (inclusive).
+            display_name: Optional label for the new clip.
+
+        Returns:
+            The newly created cropped clip.
+
+        Raises:
+            ProjectServiceError: If flags, source video, or crop range is invalid.
+        """
+        source_clip = self.get_clip(clip_id)
+        resource = self.get_resource(source_clip.resource_id)
+
+        source_path = self.get_clip_video_path(source_clip)
+        if not source_path.is_file():
+            raise ProjectServiceError(f"Source video not found: {source_path}")
+
+        metadata = self._probe_video_metadata(source_path)
+        duration_frames = int(metadata["duration_frames"])
+        if duration_frames <= 0:
+            raise ProjectServiceError(
+                "Cannot crop: unable to determine source video frame count."
+            )
+
+        start_raw = self._resolve_crop_flag_frame(
+            clip_id, start_flag_id, duration_frames, edge="start"
+        )
+        end_raw = self._resolve_crop_flag_frame(
+            clip_id, end_flag_id, duration_frames, edge="end"
+        )
+        start_frame, end_frame = self._resolve_crop_frames(
+            start_raw,
+            end_raw,
+            duration_frames,
+        )
+
+        ext = source_path.suffix or ".mp4"
+        version_filename = f"crop_{start_frame}_{end_frame}_{uuid4().hex[:8]}{ext}"
+        versions_dir = self._resource_root(resource) / "versions"
+        versions_dir.mkdir(parents=True, exist_ok=True)
+        output_path = versions_dir / version_filename
+
+        self._write_video_crop(
+            source_path,
+            output_path,
+            start_frame,
+            end_frame,
+            float(metadata["fps"]),
+        )
+
+        label = display_name or (
+            f"{source_clip.display_name} [{start_frame}-{end_frame}]"
+        )
+
+        cropped_clip = Clip(
+            resource_id=resource.id,
+            display_name=label,
+            source_clip_id=source_clip.id,
+            version_filename=version_filename,
+            trim_start_frame=start_frame,
+            trim_end_frame=end_frame,
+        )
+        project = self._require_project()
+        project.clips[cropped_clip.id] = cropped_clip
+        self.save_project()
+        return cropped_clip
+
+    def get_clip_video_path(self, clip: Clip) -> Path:
+        """Return the on-disk video file path for a clip (original or cropped version)."""
+        resource = self.get_resource(clip.resource_id)
+        resource_root = self._resource_root(resource)
+        if clip.version_filename:
+            return resource_root / "versions" / clip.version_filename
+        return resource_root / "original" / resource.original_filename
+
     def get_resource(self, resource_id: str) -> Resource:
         """Return a resource by ID.
 
@@ -262,6 +368,91 @@ class ProjectService:
     def _resource_root(self, resource: Resource) -> Path:
         assert self._project_path is not None
         return self._project_path / self.RESOURCES_DIR / resource.folder_name
+
+    def _resolve_crop_flag_frame(
+        self,
+        clip_id: str,
+        flag_id: str,
+        duration_frames: int,
+        edge: str,
+    ) -> int:
+        """Map a flag ID (or edge sentinel) to a frame number."""
+        if flag_id == self.EDGE_START_FLAG:
+            return 0
+        if flag_id == self.EDGE_END_FLAG:
+            return max(duration_frames - 1, 0)
+        return self.get_flag(clip_id, flag_id).frame
+
+    @staticmethod
+    def _resolve_crop_frames(
+        start: int,
+        end: int,
+        duration_frames: int,
+    ) -> tuple[int, int]:
+        """Clamp and order crop bounds to valid inclusive frame indices."""
+        last_frame = max(duration_frames - 1, 0)
+        start_frame = max(0, min(start, last_frame))
+        end_frame = max(0, min(end, last_frame))
+        if start_frame > end_frame:
+            start_frame, end_frame = end_frame, start_frame
+        return start_frame, end_frame
+
+    @staticmethod
+    def _write_video_crop(
+        source_path: Path,
+        output_path: Path,
+        start_frame: int,
+        end_frame: int,
+        fps: float,
+    ) -> None:
+        """Write an inclusive frame-range crop from source to output."""
+        try:
+            import cv2  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ProjectServiceError(
+                "OpenCV is required for video cropping. Install opencv-python-headless."
+            ) from exc
+
+        capture = cv2.VideoCapture(str(source_path))
+        if not capture.isOpened():
+            raise ProjectServiceError(f"Unable to open video: {source_path}")
+
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if width <= 0 or height <= 0:
+            capture.release()
+            raise ProjectServiceError(f"Invalid video dimensions: {source_path}")
+
+        effective_fps = float(capture.get(cv2.CAP_PROP_FPS) or fps or 30.0)
+        if effective_fps <= 0:
+            effective_fps = 30.0
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            str(output_path),
+            fourcc,
+            effective_fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            capture.release()
+            raise ProjectServiceError(f"Unable to create output video: {output_path}")
+
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frames_written = 0
+        for _ in range(start_frame, end_frame + 1):
+            ok, frame = capture.read()
+            if not ok:
+                break
+            writer.write(frame)
+            frames_written += 1
+
+        capture.release()
+        writer.release()
+
+        if frames_written == 0:
+            output_path.unlink(missing_ok=True)
+            raise ProjectServiceError("Crop produced no frames.")
 
     @staticmethod
     def _sanitize_project_folder_name(name: str) -> str:
