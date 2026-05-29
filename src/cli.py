@@ -7,7 +7,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from src.api.project_service import ProjectService, ProjectServiceError
+from src.api.errors import ProjectServiceError
+from src.api.project_service import ProjectService
 from src.project_state import load_active_project_path, save_active_project_path
 
 

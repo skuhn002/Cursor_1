@@ -10,11 +10,9 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
+from src.api.errors import ProjectServiceError
+from src.api.video import probe_metadata, resolve_crop_frames, write_crop, write_thumbnail
 from src.models import Clip, Flag, Project, ProjectFile, Resource
-
-
-class ProjectServiceError(Exception):
-    """Raised when a project operation fails."""
 
 
 class ProjectService:
@@ -170,13 +168,13 @@ class ProjectService:
         dest_original = original_dir / original_filename
         shutil.copy2(source, dest_original)
 
-        metadata = self._probe_video_metadata(dest_original)
+        metadata = probe_metadata(dest_original)
         resource.duration_frames = metadata["duration_frames"]
         resource.fps = metadata["fps"]
         resource.width = metadata["width"]
         resource.height = metadata["height"]
 
-        self._generate_thumbnail_stub(dest_original, thumbnails_dir / "poster.jpg")
+        write_thumbnail(dest_original, thumbnails_dir / "poster.jpg")
 
         clip = Clip(
             resource_id=resource.id,
@@ -288,7 +286,7 @@ class ProjectService:
         if not source_path.is_file():
             raise ProjectServiceError(f"Source video not found: {source_path}")
 
-        metadata = self._probe_video_metadata(source_path)
+        metadata = probe_metadata(source_path)
         duration_frames = int(metadata["duration_frames"])
         if duration_frames <= 0:
             raise ProjectServiceError(
@@ -301,7 +299,7 @@ class ProjectService:
         end_raw = self._resolve_crop_flag_frame(
             clip_id, end_flag_id, duration_frames, edge="end"
         )
-        start_frame, end_frame = self._resolve_crop_frames(
+        start_frame, end_frame = resolve_crop_frames(
             start_raw,
             end_raw,
             duration_frames,
@@ -313,7 +311,7 @@ class ProjectService:
         versions_dir.mkdir(parents=True, exist_ok=True)
         output_path = versions_dir / version_filename
 
-        self._write_video_crop(
+        write_crop(
             source_path,
             output_path,
             start_frame,
@@ -384,77 +382,6 @@ class ProjectService:
         return self.get_flag(clip_id, flag_id).frame
 
     @staticmethod
-    def _resolve_crop_frames(
-        start: int,
-        end: int,
-        duration_frames: int,
-    ) -> tuple[int, int]:
-        """Clamp and order crop bounds to valid inclusive frame indices."""
-        last_frame = max(duration_frames - 1, 0)
-        start_frame = max(0, min(start, last_frame))
-        end_frame = max(0, min(end, last_frame))
-        if start_frame > end_frame:
-            start_frame, end_frame = end_frame, start_frame
-        return start_frame, end_frame
-
-    @staticmethod
-    def _write_video_crop(
-        source_path: Path,
-        output_path: Path,
-        start_frame: int,
-        end_frame: int,
-        fps: float,
-    ) -> None:
-        """Write an inclusive frame-range crop from source to output."""
-        try:
-            import cv2  # type: ignore[import-untyped]
-        except ImportError as exc:
-            raise ProjectServiceError(
-                "OpenCV is required for video cropping. Install opencv-python-headless."
-            ) from exc
-
-        capture = cv2.VideoCapture(str(source_path))
-        if not capture.isOpened():
-            raise ProjectServiceError(f"Unable to open video: {source_path}")
-
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        if width <= 0 or height <= 0:
-            capture.release()
-            raise ProjectServiceError(f"Invalid video dimensions: {source_path}")
-
-        effective_fps = float(capture.get(cv2.CAP_PROP_FPS) or fps or 30.0)
-        if effective_fps <= 0:
-            effective_fps = 30.0
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            str(output_path),
-            fourcc,
-            effective_fps,
-            (width, height),
-        )
-        if not writer.isOpened():
-            capture.release()
-            raise ProjectServiceError(f"Unable to create output video: {output_path}")
-
-        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        frames_written = 0
-        for _ in range(start_frame, end_frame + 1):
-            ok, frame = capture.read()
-            if not ok:
-                break
-            writer.write(frame)
-            frames_written += 1
-
-        capture.release()
-        writer.release()
-
-        if frames_written == 0:
-            output_path.unlink(missing_ok=True)
-            raise ProjectServiceError("Crop produced no frames.")
-
-    @staticmethod
     def _sanitize_project_folder_name(name: str) -> str:
         """Convert a project name into a safe ``Name.clip`` folder."""
         slug = re.sub(r"[^\w\s-]", "", name.strip())
@@ -462,50 +389,3 @@ class ProjectService:
         if not slug:
             slug = "untitled"
         return f"{slug}{ProjectService.PROJECT_EXTENSION}"
-
-    @staticmethod
-    def _probe_video_metadata(video_path: Path) -> dict[str, float | int]:
-        """Best-effort video metadata; returns sensible defaults if probing fails."""
-        defaults: dict[str, float | int] = {
-            "duration_frames": 0,
-            "fps": 30.0,
-            "width": 0,
-            "height": 0,
-        }
-        try:
-            import cv2  # type: ignore[import-untyped]
-
-            capture = cv2.VideoCapture(str(video_path))
-            if not capture.isOpened():
-                return defaults
-            fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
-            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-            capture.release()
-            return {
-                "duration_frames": frame_count,
-                "fps": fps if fps > 0 else 30.0,
-                "width": width,
-                "height": height,
-            }
-        except ImportError:
-            return defaults
-
-    @staticmethod
-    def _generate_thumbnail_stub(video_path: Path, thumbnail_path: Path) -> None:
-        """Generate a poster thumbnail or write a placeholder stub."""
-        try:
-            import cv2  # type: ignore[import-untyped]
-
-            capture = cv2.VideoCapture(str(video_path))
-            if capture.isOpened():
-                ok, frame = capture.read()
-                capture.release()
-                if ok:
-                    cv2.imwrite(str(thumbnail_path), frame)
-                    return
-        except ImportError:
-            pass
-
-        thumbnail_path.write_bytes(b"")

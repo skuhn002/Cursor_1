@@ -8,7 +8,10 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Callable, Optional
 
-from src.api.project_service import ProjectService, ProjectServiceError
+from src.api.errors import ProjectServiceError
+from src.api.project_service import ProjectService
+from src.api.video import normalize_fps
+from src.gui.theme import Colors, Fonts, Spacing
 
 
 class ClipPreviewPanel(ttk.LabelFrame):
@@ -19,7 +22,7 @@ class ClipPreviewPanel(ttk.LabelFrame):
         parent: tk.Misc,
         on_status: Optional[Callable[[str], None]] = None,
     ) -> None:
-        super().__init__(parent, text="Preview", padding=12)
+        super().__init__(parent, text="Preview", padding=Spacing.SECTION, style="Card.TLabelframe")
         self._on_status = on_status
 
         self._service: Optional[ProjectService] = None
@@ -34,40 +37,76 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._next_frame_deadline = 0.0
         self._photo: Optional[tk.PhotoImage] = None
         self._scrubbing = False
+        self._last_frame_bgr = None
+        self._resize_after_id: Optional[str] = None
 
         self._clip_name_var = tk.StringVar(value="No clip selected")
-        self._frame_info_var = tk.StringVar(value="Frame — / —")
+        self._frame_entry_var = tk.StringVar(value="1")
+        self._frame_total_var = tk.StringVar(value="—")
+        self._syncing_entry = False
 
-        ttk.Label(self, textvariable=self._clip_name_var, font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", pady=(0, 8)
+        ttk.Label(self, textvariable=self._clip_name_var, font=Fonts.BODY_BOLD).pack(
+            anchor="w", pady=(0, Spacing.CONTROL_GAP)
         )
+
+        preview_border = tk.Frame(self, bg=Colors.PREVIEW_BORDER)
+        preview_border.pack(fill="both", expand=True)
 
         self._canvas = tk.Canvas(
-            self,
+            preview_border,
             width=480,
             height=270,
-            bg="#111111",
-            highlightthickness=1,
-            highlightbackground="#cccccc",
+            bg=Colors.PREVIEW_BG,
+            highlightthickness=0,
+            bd=0,
         )
-        self._canvas.pack(fill="both", expand=True)
+        self._canvas.pack(fill="both", expand=True, padx=3, pady=3)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
         self._placeholder = self._canvas.create_text(
             240,
             135,
             text="Select a clip to preview",
-            fill="#888888",
-            font=("Segoe UI", 11),
+            fill=Colors.TEXT_MUTED,
+            font=Fonts.HEADING,
         )
 
         controls = ttk.Frame(self)
-        controls.pack(fill="x", pady=(8, 0))
+        controls.pack(fill="x", pady=(Spacing.CONTROL_GAP, 0))
 
         self._play_btn = ttk.Button(controls, text="Play", command=self.toggle_play, width=8)
         self._play_btn.pack(side="left")
         ttk.Button(controls, text="Stop", command=self.stop_playback, width=8).pack(
-            side="left", padx=(6, 0)
+            side="left", padx=(Spacing.CONTROL_GAP, 0)
         )
-        ttk.Label(controls, textvariable=self._frame_info_var).pack(side="right")
+
+        frame_nav = ttk.Frame(self)
+        frame_nav.pack(fill="x", pady=(Spacing.CONTROL_GAP, 0))
+
+        self._prev_frame_btn = ttk.Button(
+            frame_nav,
+            text="◀",
+            width=3,
+            command=lambda: self._step_frame(-1),
+        )
+        self._prev_frame_btn.pack(side="left")
+
+        ttk.Label(frame_nav, text="Frame").pack(side="left", padx=(Spacing.CONTROL_GAP, 4))
+        self._frame_entry = ttk.Entry(frame_nav, textvariable=self._frame_entry_var, width=8)
+        self._frame_entry.pack(side="left")
+        self._frame_entry.bind("<Return>", self._go_to_entered_frame)
+        self._frame_entry.bind("<FocusOut>", self._go_to_entered_frame)
+
+        ttk.Label(frame_nav, textvariable=self._frame_total_var).pack(
+            side="left", padx=(4, Spacing.CONTROL_GAP)
+        )
+
+        self._next_frame_btn = ttk.Button(
+            frame_nav,
+            text="▶",
+            width=3,
+            command=lambda: self._step_frame(1),
+        )
+        self._next_frame_btn.pack(side="left")
 
         self._scrubber = ttk.Scale(
             self,
@@ -76,7 +115,7 @@ class ClipPreviewPanel(ttk.LabelFrame):
             orient="horizontal",
             command=self._on_scrub,
         )
-        self._scrubber.pack(fill="x", pady=(8, 0))
+        self._scrubber.pack(fill="x", pady=(Spacing.CONTROL_GAP, 0))
         self._scrubber.bind("<ButtonPress-1>", self._on_scrub_start)
         self._scrubber.bind("<ButtonRelease-1>", self._on_scrub_end)
 
@@ -95,12 +134,16 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._frame_count = 0
         self._current_frame = 0
         self._photo = None
+        self._last_frame_bgr = None
         self._clip_name_var.set("No clip selected")
-        self._frame_info_var.set("Frame — / —")
+        self._frame_total_var.set("—")
+        self._sync_frame_entry(1)
         self._scrubber.configure(from_=0, to=0)
         self._scrubber.set(0)
         self._canvas.delete("frame")
         self._canvas.itemconfigure(self._placeholder, state="normal")
+        canvas_w, canvas_h = self._canvas_size()
+        self._canvas.coords(self._placeholder, canvas_w // 2, canvas_h // 2)
         self._set_controls_enabled(False)
 
     def load_clip(self, clip_id: Optional[str]) -> None:
@@ -141,7 +184,7 @@ class ClipPreviewPanel(ttk.LabelFrame):
 
         resource = self._service.get_resource(clip.resource_id)
         capture_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-        fps = self._normalize_fps(resource.fps, capture_fps)
+        fps = normalize_fps(resource.fps, capture_fps)
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if frame_count <= 0 and resource.duration_frames > 0:
             frame_count = resource.duration_frames
@@ -156,8 +199,33 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._clip_name_var.set(clip.display_name)
         self._scrubber.configure(from_=0, to=max(frame_count - 1, 0))
         self._scrubber.set(0)
+        self._frame_total_var.set(f"/ {frame_count}")
         self._set_controls_enabled(True)
         self._show_frame(0)
+        self.after_idle(self._rerender_last_frame)
+
+    def _canvas_size(self) -> tuple[int, int]:
+        """Return the drawable canvas size, falling back before first layout."""
+        width = self._canvas.winfo_width()
+        height = self._canvas.winfo_height()
+        if width <= 1:
+            width = self._canvas.winfo_reqwidth()
+        if height <= 1:
+            height = self._canvas.winfo_reqheight()
+        return max(width, 1), max(height, 1)
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        """Re-fit the current frame when the preview area is resized."""
+        if event.widget is not self._canvas or self._last_frame_bgr is None:
+            return
+        if self._resize_after_id is not None:
+            self.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.after(50, self._rerender_last_frame)
+
+    def _rerender_last_frame(self) -> None:
+        self._resize_after_id = None
+        if self._last_frame_bgr is not None:
+            self._render_frame(self._last_frame_bgr)
 
     def toggle_play(self) -> None:
         """Start or pause playback."""
@@ -235,16 +303,8 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._render_frame(frame)
         if not self._scrubbing:
             self._scrubber.set(self._current_frame)
-        self._frame_info_var.set(f"Frame {self._current_frame + 1} / {self._frame_count}")
+        self._sync_frame_entry(self._current_frame + 1)
         return True
-
-    @staticmethod
-    def _normalize_fps(resource_fps: float, capture_fps: float) -> float:
-        """Pick a sensible playback frame rate from resource or container metadata."""
-        for candidate in (resource_fps, capture_fps):
-            if 1.0 <= candidate <= 240.0:
-                return candidate
-        return 30.0
 
     def _show_frame(self, frame_index: int) -> None:
         if self._capture is None:
@@ -263,33 +323,73 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._render_frame(frame)
         if not self._scrubbing:
             self._scrubber.set(frame_index)
-        self._frame_info_var.set(f"Frame {frame_index + 1} / {self._frame_count}")
+        self._sync_frame_entry(frame_index + 1)
+
+    def _step_frame(self, delta: int) -> None:
+        """Move to the previous or next frame."""
+        if self._capture is None or self._frame_count <= 0:
+            return
+        if self._playing:
+            self._pause()
+        target = max(0, min(self._current_frame + delta, self._frame_count - 1))
+        if target != self._current_frame:
+            self._show_frame(target)
+
+    def _go_to_entered_frame(self, _event: object = None) -> None:
+        """Jump to the frame number entered by the user (1-based)."""
+        if self._syncing_entry or self._capture is None:
+            return
+
+        raw = self._frame_entry_var.get().strip()
+        if not raw.isdigit():
+            self._sync_frame_entry(self._current_frame + 1)
+            return
+
+        user_frame = int(raw)
+        user_frame = max(1, min(user_frame, self._frame_count))
+        if self._playing:
+            self._pause()
+        self._show_frame(user_frame - 1)
+
+    def _sync_frame_entry(self, display_frame: int) -> None:
+        """Update the frame entry without triggering a seek."""
+        self._syncing_entry = True
+        self._frame_entry_var.set(str(display_frame))
+        self._syncing_entry = False
 
     def _render_frame(self, frame_bgr) -> None:
         import cv2  # type: ignore[import-untyped]
 
-        canvas_w = max(self._canvas.winfo_width(), 480)
-        canvas_h = max(self._canvas.winfo_height(), 270)
+        self._last_frame_bgr = frame_bgr
+        canvas_w, canvas_h = self._canvas_size()
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
-        scale = min(canvas_w / width, canvas_h / height, 1.0)
-        if scale < 1.0:
-            rgb = cv2.resize(
-                rgb,
-                (max(int(width * scale), 1), max(int(height * scale), 1)),
-                interpolation=cv2.INTER_AREA,
-            )
+        if width <= 0 or height <= 0:
+            return
+
+        scale = min(canvas_w / width, canvas_h / height)
+        target_w = max(int(width * scale), 1)
+        target_h = max(int(height * scale), 1)
+        if target_w != width or target_h != height:
+            interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            rgb = cv2.resize(rgb, (target_w, target_h), interpolation=interpolation)
 
         height, width = rgb.shape[:2]
         header = f"P6 {width} {height} 255 ".encode("ascii")
-        self._photo = tk.PhotoImage(width=width, height=height, data=header + rgb.tobytes(), format="PPM")
+        self._photo = tk.PhotoImage(
+            width=width,
+            height=height,
+            data=header + rgb.tobytes(),
+            format="PPM",
+        )
 
         self._canvas.delete("frame")
         self._canvas.itemconfigure(self._placeholder, state="hidden")
         x = canvas_w // 2
         y = canvas_h // 2
         self._canvas.create_image(x, y, image=self._photo, anchor="center", tags="frame")
+        self._canvas.coords(self._placeholder, x, y)
 
     def _on_scrub_start(self, _event: object) -> None:
         self._scrubbing = True
@@ -324,3 +424,6 @@ class ClipPreviewPanel(ttk.LabelFrame):
         state = "normal" if enabled else "disabled"
         self._play_btn.configure(state=state)
         self._scrubber.configure(state=state)
+        self._prev_frame_btn.configure(state=state)
+        self._next_frame_btn.configure(state=state)
+        self._frame_entry.configure(state=state)

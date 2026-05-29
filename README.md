@@ -207,16 +207,24 @@ src/
 ├── models.py              # Pure Pydantic data models (no I/O)
 ├── project_state.py       # Active-project pointer (.moment.json)
 ├── api/
-│   └── project_service.py # Business logic and file operations
+│   ├── errors.py          # Shared API exceptions
+│   ├── video.py           # OpenCV probing, thumbnails, cropping
+│   └── project_service.py # Project lifecycle and domain operations
 ├── cli.py                 # Command-line interface
 └── gui/
-    └── app.py             # tkinter desktop UI
+    ├── theme.py           # Colors, fonts, ttk styling
+    ├── constants.py       # Shared GUI constants
+    ├── flags.py           # Flag display helpers
+    ├── app.py             # Main window and coordination
+    ├── dialogs/           # Modal dialogs (new project, import, flags, crop)
+    └── panels/            # Clip list and preview panels
 ```
 
 | Layer | Responsibility |
 |-------|----------------|
 | **Models** | `Resource`, `Flag`, `Clip`, `Project`, `ProjectFile` — validation and serialization only |
-| **ProjectService** | Create/load/save projects, import video, manage flags |
+| **ProjectService** | Create/load/save projects, import video, manage flags, crop clips |
+| **video** | Low-level OpenCV video probing, thumbnails, and frame-range export |
 | **CLI / GUI** | User interaction; delegates all domain work to `ProjectService` |
 
 **Timing model:** frame numbers are the primary unit. FPS is stored on each resource for display and future timecode conversion.
