@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moment"
+version = "0.1.0"
+description = "Moment — a lightweight, flag-driven video editor"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Moment Contributors" }]
+keywords = ["video", "editor", "flags", "markers"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "pydantic>=2.0,<3.0",
+    "opencv-python-headless>=4.8,<5.0",
+]
+
+[project.scripts]
+moment = "src.cli:entrypoint"
+moment-gui = "src.gui.app:entrypoint"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
