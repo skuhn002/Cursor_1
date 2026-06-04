@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from typing import Literal, Optional
 
 import numpy as np
 
 FrameStatus = Literal["frame", "eof", "empty"]
+
+# ffpyplayer/SDL needs time to stop audio before close_player on Windows.
+_CLOSE_SETTLE_SECONDS = 0.25
 
 
 def playback_available() -> bool:
@@ -47,39 +52,128 @@ class MediaPlayback:
 
     def __init__(self) -> None:
         self._player = None
+        self._path: Optional[str] = None
+        self._lock = threading.RLock()
+        self._close_ready = threading.Event()
+        self._close_ready.set()
+        self._generation = 0
 
     @property
     def is_open(self) -> bool:
-        return self._player is not None
+        with self._lock:
+            return self._player is not None
 
     def open(self, video_path: Path, start_time: float) -> None:
         """Open a file and seek to ``start_time`` seconds."""
         from ffpyplayer.player import MediaPlayer
 
-        self.close()
-        self._player = MediaPlayer(
-            str(video_path),
-            ff_opts={"sync": "audio"},
-        )
-        if start_time > 0:
-            self._player.seek(start_time, relative=False)
+        self._wait_for_close()
+        path_str = str(video_path.resolve())
+
+        with self._lock:
+            self._release_player_unlocked(blocking=True)
+            self._generation += 1
+            self._player = MediaPlayer(
+                path_str,
+                ff_opts={"sync": "audio", "loglevel": "quiet"},
+            )
+            self._path = path_str
+            if start_time > 0:
+                self._player.seek(start_time, relative=False)
 
     def close(self) -> None:
-        """Stop playback and release resources."""
-        if self._player is not None:
-            self._player.close_player()
+        """Stop playback and release resources on a worker thread."""
+        with self._lock:
+            if self._player is None:
+                self._close_ready.set()
+                return
+            player = self._player
             self._player = None
+            self._path = None
+            self._generation += 1
+            self._close_ready.clear()
+
+        threading.Thread(
+            target=self._release_player_worker,
+            args=(player,),
+            name="moment-media-close",
+            daemon=True,
+        ).start()
+
+    def close_sync(self) -> None:
+        """Block until playback resources are fully released."""
+        with self._lock:
+            player = self._player
+            self._player = None
+            self._path = None
+            self._generation += 1
+        if player is not None:
+            self._release_player_worker(player)
+        self._close_ready.set()
+
+    def _wait_for_close(self) -> None:
+        if not self._close_ready.wait(timeout=5.0):
+            self._close_ready.set()
+
+    def _release_player_unlocked(self, *, blocking: bool) -> None:
+        player = self._player
+        self._player = None
+        self._path = None
+        if player is None:
+            return
+        self._generation += 1
+        if blocking:
+            self._release_player_worker(player)
+        else:
+            threading.Thread(
+                target=self._release_player_worker,
+                args=(player,),
+                name="moment-media-close",
+                daemon=True,
+            ).start()
+
+    def _release_player_worker(self, player) -> None:
+        try:
+            try:
+                player.set_pause(True)
+            except Exception:
+                pass
+
+            deadline = time.time() + 0.75
+            while time.time() < deadline:
+                try:
+                    _frame, val = player.get_frame()
+                except Exception:
+                    break
+                if val == "eof":
+                    break
+                time.sleep(0.01)
+
+            try:
+                player.close_player()
+            except Exception:
+                pass
+        finally:
+            time.sleep(_CLOSE_SETTLE_SECONDS)
+            self._close_ready.set()
 
     def poll(self) -> tuple[Optional[np.ndarray], float, FrameStatus, float]:
-        """Return the next frame if one is ready, synchronized with audio.
-
-        The fourth value is ffpyplayer's suggested realtime delay (seconds) before
-        displaying the frame to maintain 1.0x playback speed.
-        """
-        if self._player is None:
+        """Return the next frame if one is ready, synchronized with audio."""
+        with self._lock:
+            player = self._player
+            generation = self._generation
+        if player is None:
             return None, 0.0, "empty", 0.0
 
-        frame, val = self._player.get_frame()
+        try:
+            frame, val = player.get_frame()
+        except Exception:
+            return None, 0.0, "eof", 0.0
+
+        with self._lock:
+            if self._player is not player or self._generation != generation:
+                return None, 0.0, "eof", 0.0
+
         if val == "eof":
             return None, 0.0, "eof", 0.0
         if val == "paused":

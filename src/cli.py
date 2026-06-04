@@ -44,6 +44,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
     print(f"Imported clip: {clip.display_name}")
     print(f"Clip ID: {clip.id}")
     print(f"Resource ID: {clip.resource_id}")
+    print("Added to workspace (use 'compose insert' to include in the composition).")
     return 0
 
 
@@ -66,24 +67,68 @@ def _cmd_addflag(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_import_image(args: argparse.Namespace) -> int:
+    service = _get_service(
+        Path(args.project).resolve() if args.project else None
+    )
+    image_path = Path(args.image_path).expanduser()
+    if args.frames is not None and args.seconds is not None:
+        raise ProjectServiceError("Specify either --frames or --seconds, not both.")
+
+    clip = service.import_image(
+        image_path,
+        display_name=args.display_name,
+        frame_count=args.frames,
+        duration_seconds=args.seconds,
+    )
+    resource = service.get_resource(clip.resource_id)
+    print(f"Imported image clip: {clip.display_name}")
+    print(f"Clip ID: {clip.id}")
+    print(f"Duration: {resource.duration_frames} frames @ {resource.fps:.0f} fps")
+    print("Added to workspace (use 'compose insert' to include in the composition).")
+    return 0
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     service = _get_service(
         Path(args.project).resolve() if args.project else None
     )
-    clips = service.list_clips()
-    if not clips:
+    project = service.project
+    assert project is not None
+
+    workspace = service.list_workspace_clips()
+    composition = service.list_clips()
+
+    if not workspace and not composition:
         print("No clips in project.")
         return 0
 
-    project = service.project
-    assert project is not None
-    print(f"Project: {project.name} ({len(clips)} clip(s))")
+    print(f"Project: {project.name}")
     print("-" * 60)
-    for clip in clips:
-        resource = project.resources.get(clip.resource_id)
-        flag_count = len(clip.flags)
-        res_name = resource.display_name if resource else "?"
-        print(f"{clip.id}  {clip.display_name}  [{res_name}]  {flag_count} flag(s)")
+    print(f"Workspace ({len(workspace)} clip(s))")
+    if workspace:
+        for clip in workspace:
+            resource = project.resources.get(clip.resource_id)
+            flag_count = len(clip.flags)
+            res_name = resource.display_name if resource else "?"
+            kind = f" [{resource.media_kind}]" if resource and resource.media_kind != "video" else ""
+            print(f"  {clip.id}  {clip.display_name}{kind}  [{res_name}]  {flag_count} flag(s)")
+    else:
+        print("  (empty)")
+
+    print(f"Composition ({len(composition)} clip(s))")
+    if composition:
+        for index, clip in enumerate(composition, start=1):
+            resource = project.resources.get(clip.resource_id)
+            flag_count = len(clip.flags)
+            res_name = resource.display_name if resource else "?"
+            kind = f" [{resource.media_kind}]" if resource and resource.media_kind != "video" else ""
+            print(
+                f"  {index:>3}. {clip.id}  {clip.display_name}{kind}  "
+                f"[{res_name}]  {flag_count} flag(s)"
+            )
+    else:
+        print("  (empty)")
     return 0
 
 
@@ -97,6 +142,7 @@ def _cmd_info(args: argparse.Namespace) -> int:
 
     print(f"Clip: {clip.display_name} ({clip.id})")
     print(f"Resource: {resource.display_name} ({resource.id})")
+    print(f"Type: {resource.media_kind}")
     print(f"File: {resource.original_filename}")
     if clip.version_filename:
         print(f"Version: {clip.version_filename}")
@@ -104,6 +150,13 @@ def _cmd_info(args: argparse.Namespace) -> int:
         print(f"Trim: frames {clip.trim_start_frame}–{clip.trim_end_frame}")
     if clip.source_clip_id:
         print(f"Source clip: {clip.source_clip_id}")
+    if service.is_in_composition(args.clip_id):
+        position = service.list_composition().index(args.clip_id) + 1
+        print(f"In composition: yes (position {position})")
+    else:
+        print("In composition: no (workspace only)")
+    if clip.clip_kind == "merged" and clip.merged_from_clip_ids:
+        print(f"Merged from: {', '.join(clip.merged_from_clip_ids)}")
     print(f"Frames: {resource.duration_frames} @ {resource.fps:.2f} fps")
     print(f"Resolution: {resource.width}x{resource.height}")
     print(f"Flags: {len(flags)}")
@@ -114,6 +167,21 @@ def _cmd_info(args: argparse.Namespace) -> int:
             print(line)
             if flag.note:
                 print(f"           note: {flag.note}")
+    return 0
+
+
+def _cmd_duplicate(args: argparse.Namespace) -> int:
+    service = _get_service(
+        Path(args.project).resolve() if args.project else None
+    )
+    duplicated = service.duplicate_clip(
+        args.clip_id,
+        display_name=args.display_name,
+    )
+    print(f"Duplicated clip: {duplicated.display_name}")
+    print(f"Clip ID: {duplicated.id}")
+    print(f"Source clip: {duplicated.source_clip_id}")
+    print("Added to workspace (use 'compose insert' to include in the composition).")
     return 0
 
 
@@ -129,8 +197,91 @@ def _cmd_crop(args: argparse.Namespace) -> int:
     )
     print(f"Cropped clip: {cropped.display_name}")
     print(f"Clip ID: {cropped.id}")
-    print(f"Frames: {cropped.trim_start_frame}–{cropped.trim_end_frame}")
-    print(f"Version: {cropped.version_filename}")
+    if cropped.version_filename:
+        print(f"Version: {cropped.version_filename}")
+    resource = service.get_resource(cropped.resource_id)
+    print(f"Frames: {service.get_clip_playback_frame_count(cropped)} @ {resource.fps:.0f} fps")
+    return 0
+
+
+def _cmd_compose_list(args: argparse.Namespace) -> int:
+    service = _get_service(
+        Path(args.project).resolve() if args.project else None
+    )
+    clips = service.list_clips()
+    if not clips:
+        print("Composition is empty.")
+        return 0
+
+    print(f"Composition ({len(clips)} clip(s))")
+    print("-" * 60)
+    for index, clip in enumerate(clips, start=1):
+        print(f"{index:>3}. {clip.display_name}  ({clip.id})")
+    return 0
+
+
+def _cmd_compose_insert(args: argparse.Namespace) -> int:
+    service = _get_service(
+        Path(args.project).resolve() if args.project else None
+    )
+    if args.start:
+        service.prepend_to_composition(args.clip_id)
+    elif args.end:
+        service.append_to_composition(args.clip_id)
+    elif args.before:
+        service.insert_clip_in_composition(args.clip_id, args.before, "before")
+    elif args.after:
+        service.insert_clip_in_composition(args.clip_id, args.after, "after")
+    elif args.between_before and args.between_after:
+        service.insert_clip_between(args.clip_id, args.between_before, args.between_after)
+    else:
+        raise ProjectServiceError(
+            "Specify one placement option: --start, --end, --before, --after, "
+            "or both --between-before and --between-after."
+        )
+
+    clips = service.list_clips()
+    position = next(
+        (index for index, clip in enumerate(clips, start=1) if clip.id == args.clip_id),
+        None,
+    )
+    print(f"Placed clip {args.clip_id} at position {position} in the composition.")
+    return 0
+
+
+def _cmd_compose_remove(args: argparse.Namespace) -> int:
+    service = _get_service(
+        Path(args.project).resolve() if args.project else None
+    )
+    service.remove_from_composition(args.clip_id)
+    print(f"Removed clip {args.clip_id} from the composition (still in workspace).")
+    return 0
+
+
+def _cmd_compose_merge(args: argparse.Namespace) -> int:
+    service = _get_service(
+        Path(args.project).resolve() if args.project else None
+    )
+    if args.replace and args.add:
+        raise ProjectServiceError("Use only one of --replace or --add.")
+
+    clip = service.merge_composition_to_clip(
+        display_name=args.display_name,
+        add_to_composition=args.add,
+        replace_composition=args.replace,
+    )
+    resource = service.get_resource(clip.resource_id)
+    print(f"Merged clip: {clip.display_name}")
+    print(f"Clip ID: {clip.id}")
+    print(f"Source clips: {', '.join(clip.merged_from_clip_ids)}")
+    print(f"Duration: {resource.duration_frames} frames @ {resource.fps:.0f} fps")
+    print(f"Flags preserved: {len(clip.flags)}")
+    if args.replace:
+        print("Composition replaced with the merged clip.")
+    elif args.add:
+        print("Merged clip appended to the composition.")
+    else:
+        print("Merged clip added to the workspace.")
     return 0
 
 
@@ -165,6 +316,31 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     import_p.set_defaults(func=_cmd_import)
 
+    import_image_p = sub.add_parser(
+        "import-image",
+        help="Import a still image as a timed workspace clip",
+    )
+    import_image_p.add_argument("image_path", help="Path to the source image file")
+    import_image_p.add_argument(
+        "display_name",
+        nargs="?",
+        default=None,
+        help="Optional display name for the clip",
+    )
+    import_image_p.add_argument(
+        "--frames",
+        type=int,
+        default=None,
+        help="Clip length in frames (default: 30)",
+    )
+    import_image_p.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="Clip length in seconds at 30 fps",
+    )
+    import_image_p.set_defaults(func=_cmd_import_image)
+
     flag_p = sub.add_parser("addflag", help="Add a flag to a clip at a frame")
     flag_p.add_argument("clip_id", help="Target clip ID")
     flag_p.add_argument("frame", type=int, help="Frame number")
@@ -189,6 +365,19 @@ def _build_parser() -> argparse.ArgumentParser:
     info_p.add_argument("clip_id", help="Clip ID to inspect")
     info_p.set_defaults(func=_cmd_info)
 
+    duplicate_p = sub.add_parser(
+        "duplicate",
+        help="Duplicate a clip with its own media copy (workspace only)",
+    )
+    duplicate_p.add_argument("clip_id", help="Clip ID to duplicate")
+    duplicate_p.add_argument(
+        "--name",
+        dest="display_name",
+        default=None,
+        help="Optional display name for the copy",
+    )
+    duplicate_p.set_defaults(func=_cmd_duplicate)
+
     crop_p = sub.add_parser(
         "crop",
         help="Crop a clip between two flags (creates a new clip)",
@@ -203,6 +392,78 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional display name for the cropped clip",
     )
     crop_p.set_defaults(func=_cmd_crop)
+
+    compose_p = sub.add_parser("compose", help="Manage the clip composition order")
+    compose_sub = compose_p.add_subparsers(dest="compose_command", required=True)
+
+    compose_list_p = compose_sub.add_parser("list", help="List clips in composition order")
+    compose_list_p.set_defaults(func=_cmd_compose_list)
+
+    compose_insert_p = compose_sub.add_parser(
+        "insert",
+        help="Place a clip in the composition",
+    )
+    compose_insert_p.add_argument("clip_id", help="Clip ID to place")
+    compose_insert_p.add_argument(
+        "--start",
+        action="store_true",
+        help="Place at the start of the composition",
+    )
+    compose_insert_p.add_argument(
+        "--end",
+        action="store_true",
+        help="Place at the end of the composition",
+    )
+    compose_insert_p.add_argument(
+        "--before",
+        metavar="REF_CLIP_ID",
+        help="Place immediately before this clip",
+    )
+    compose_insert_p.add_argument(
+        "--after",
+        metavar="REF_CLIP_ID",
+        help="Place immediately after this clip",
+    )
+    compose_insert_p.add_argument(
+        "--between-before",
+        metavar="CLIP_ID",
+        help="When inserting between two clips, the earlier clip",
+    )
+    compose_insert_p.add_argument(
+        "--between-after",
+        metavar="CLIP_ID",
+        help="When inserting between two clips, the later clip",
+    )
+    compose_insert_p.set_defaults(func=_cmd_compose_insert)
+
+    compose_remove_p = compose_sub.add_parser(
+        "remove",
+        help="Remove a clip from the composition (keeps it in the workspace)",
+    )
+    compose_remove_p.add_argument("clip_id", help="Clip ID to remove from the composition")
+    compose_remove_p.set_defaults(func=_cmd_compose_remove)
+
+    compose_merge_p = compose_sub.add_parser(
+        "merge",
+        help="Concatenate composition clips into one clip with remapped flags",
+    )
+    compose_merge_p.add_argument(
+        "--name",
+        dest="display_name",
+        default=None,
+        help="Display name for the merged clip",
+    )
+    compose_merge_p.add_argument(
+        "--add",
+        action="store_true",
+        help="Append the merged clip to the composition",
+    )
+    compose_merge_p.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace the composition with only the merged clip",
+    )
+    compose_merge_p.set_defaults(func=_cmd_compose_merge)
 
     return parser
 

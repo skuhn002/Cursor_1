@@ -5,4 +5,10 @@ VIDEO_FILETYPES = [
     ("All files", "*.*"),
 ]
 
-CLIP_COLUMNS = ("display_name", "frames", "fps", "flags", "clip_id")
+IMAGE_FILETYPES = [
+    ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.tif *.tiff"),
+    ("All files", "*.*"),
+]
+
+CLIP_COLUMNS = ("order", "display_name", "frames", "fps", "flags", "clip_id")
+WORKSPACE_COLUMNS = ("display_name", "frames", "fps", "flags", "clip_id")

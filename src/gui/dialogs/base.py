@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 from src.gui.theme import Spacing
 
@@ -22,6 +22,24 @@ class ModalDialog(tk.Toplevel):
         self.body.grid(row=0, column=0, sticky="nsew")
 
         self.bind("<Escape>", lambda _event: self.destroy())
+
+    def ask_open_filename(
+        self,
+        *,
+        title: str,
+        filetypes: list[tuple[str, str]],
+    ) -> str:
+        """Open a file picker; releases modal grab so the dialog works on Windows."""
+        self.grab_release()
+        try:
+            return filedialog.askopenfilename(
+                parent=self.winfo_toplevel(),
+                title=title,
+                filetypes=filetypes,
+            )
+        finally:
+            if self.winfo_exists():
+                self.grab_set()
 
     def center_over(self, parent: tk.Misc) -> None:
         """Center this dialog over the parent window."""

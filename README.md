@@ -4,6 +4,8 @@ A lightweight, **flag-driven** video editor. Moment organizes work around projec
 
 This is an early MVP: project management, video import, flag-based cropping, and in-GUI clip preview are in place.
 
+**Architecture:** Clips are the central editing unit; the composition is an ordered list of isolated clip references. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how projects, clips, resources, and composition fit together.
+
 ---
 
 ## Features
@@ -70,7 +72,8 @@ python -m src.gui
 3. Imported clips appear in the table with frame count, FPS, and flag count.
 4. Select a clip to preview it — use **Play/Pause**, **Stop**, and the frame scrubber (audio plays during playback when ffpyplayer is installed).
 5. Select a clip → **Add Flag** (`Ctrl+F`) to mark frames while scrubbing in the preview.
-6. Select a clip → **Crop Between Flags** (`Ctrl+K`) to create a trimmed copy.
+6. Select a clip → **Duplicate Clip** (toolbar or `Ctrl+D`) — name the copy in the dialog; it lands in the workspace with its own media.
+7. Select a clip → **Crop Between Flags** (`Ctrl+K`) to create a trimmed copy.
 
 The GUI remembers your last open project via `.moment.json` in the current working directory.
 
@@ -110,7 +113,7 @@ My_Test_Project.clip/
 └── resources/
     └── video_a1b2c3d4/
         ├── original/     # copied source video
-        ├── versions/     # cropped outputs (e.g. crop_120_480_*.mp4)
+        ├── versions/     # current edit (current.mp4) and crop outputs still in use
         └── thumbnails/   # poster.jpg
 ```
 
@@ -127,6 +130,7 @@ My_Test_Project.clip/
 | `addflag <clip_id> <frame> [note] [--color HEX] [--type TYPE]` | Add a flag to a clip |
 | `list` | List all clips in the active project |
 | `info <clip_id>` | Show clip details and flags |
+| `duplicate <clip_id> [--name NAME]` | Duplicate a clip and its media into the workspace |
 | `crop <clip_id> <start_flag_id> <end_flag_id> [--name NAME]` | Crop between two flags; creates a new clip |
 
 ---
@@ -149,7 +153,7 @@ python -m src.cli info clip_abc123
 
 ### Cropping between flags
 
-Cropping extracts the **inclusive frame range** between a start flag and an end flag and writes a new video file. The **original clip is not modified** — Moment creates a **new clip** that points to the cropped file in `resources/.../versions/`.
+Cropping extracts the **inclusive frame range** between a start flag and an end flag and writes a new video file. The **original clip is not modified** — Moment creates a **new clip** that points to the cropped file in `resources/.../versions/`. Audio (including voice-over) is preserved via ffmpeg when available.
 
 **How the range is resolved:**
 

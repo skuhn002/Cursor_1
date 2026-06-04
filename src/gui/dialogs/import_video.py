@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 from typing import Callable, Optional
 
 from src.gui.constants import VIDEO_FILETYPES
@@ -45,8 +45,7 @@ class ImportVideoDialog(ModalDialog):
         self.center_over(parent)
 
     def _browse_file(self) -> None:
-        file_path = filedialog.askopenfilename(
-            parent=self,
+        file_path = self.ask_open_filename(
             title="Select video file",
             filetypes=VIDEO_FILETYPES,
         )

@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import time
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import ttk
 from typing import Callable, Optional
 
 from src.api.errors import ProjectServiceError
 from src.api.project_service import ProjectService
-from src.api.video import normalize_fps
-from src.gui.media import MediaPlayback, playback_available
+from src.api.video import clip_playback_trim, normalize_fps, resolve_playback_frame_count
+from src.gui.audio_playback import FfmpegAudioPlayback, audio_playback_available
 from src.gui.theme import Colors, Fonts, Spacing
+
+
+@dataclass(frozen=True)
+class _CompositionSegment:
+    clip_id: str
+    display_name: str
+    video_path: Path
+    fps: float
+    frame_count: int
 
 
 class ClipPreviewPanel(ttk.LabelFrame):
@@ -40,8 +50,14 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._scrubbing = False
         self._last_frame_bgr = None
         self._resize_after_id: Optional[str] = None
-        self._media = MediaPlayback()
-        self._audio_enabled = playback_available()
+        self._audio = FfmpegAudioPlayback()
+        self._audio_enabled = audio_playback_available()
+        self._composition_mode = False
+        self._composition_segments: list[_CompositionSegment] = []
+        self._composition_index = 0
+        self._playback_source_audio = True
+        self._on_playback_finished: Optional[Callable[[], None]] = None
+        self._playback_generation = 0
 
         self._clip_name_var = tk.StringVar(value="No clip selected")
         self._frame_entry_var = tk.StringVar(value="1")
@@ -124,17 +140,70 @@ class ClipPreviewPanel(ttk.LabelFrame):
 
         self._set_controls_enabled(False)
 
+    def _bump_playback_generation(self) -> int:
+        """Invalidate in-flight playback callbacks from a previous play session."""
+        self._playback_generation += 1
+        return self._playback_generation
+
+    def _playback_active(self, generation: int) -> bool:
+        return self._playing and generation == self._playback_generation
+
+    def _cancel_playback_timer(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+    def _schedule_playback(self, delay_ms: int, callback: Callable[[], None], *, generation: int) -> None:
+        self._cancel_playback_timer()
+
+        def wrapper() -> None:
+            if not self.winfo_exists():
+                return
+            if not self._playback_active(generation):
+                return
+            callback()
+
+        self._after_id = self.after(max(0, delay_ms), wrapper)
+
     def set_service(self, service: Optional[ProjectService]) -> None:
         """Attach the active project service."""
         self._service = service
 
+    def frame_count(self) -> int:
+        """Return the loaded clip's frame count (0 if none)."""
+        return self._frame_count
+
+    def clip_duration_seconds(self) -> float:
+        """Return playback length of the loaded clip in seconds."""
+        return self._frame_count / max(self._fps, 0.001)
+
+    def play_for_voiceover(
+        self,
+        *,
+        include_source_audio: bool,
+        on_finished: Callable[[], None],
+    ) -> None:
+        """Play the current clip from the start; call ``on_finished`` at end."""
+        if self._capture is None or self._composition_mode:
+            return
+        self._on_playback_finished = on_finished
+        self._playback_source_audio = include_source_audio
+        self.stop_playback()
+        self._show_frame(0)
+        self._play()
+
     def clear(self) -> None:
         """Stop playback and reset the panel."""
         self.stop_playback()
-        self._media.close()
+        self._audio.stop()
+        self._exit_composition_mode()
         self._release_capture()
         self._clip_id = None
         self._video_path = None
+        self._trim_start_frame = 0
         self._frame_count = 0
         self._current_frame = 0
         self._photo = None
@@ -150,18 +219,65 @@ class ClipPreviewPanel(ttk.LabelFrame):
         self._canvas.coords(self._placeholder, canvas_w // 2, canvas_h // 2)
         self._set_controls_enabled(False)
 
-    def load_clip(self, clip_id: Optional[str]) -> None:
+    def load_composition(self, autoplay: bool = False) -> bool:
+        """Load all clips in composition order for sequential preview."""
+        if self._service is None:
+            return False
+
+        self.stop_playback()
+        self._exit_composition_mode()
+
+        clips = self._service.list_clips()
+        if not clips:
+            if self._on_status:
+                self._on_status("Composition is empty.")
+            return False
+
+        try:
+            import cv2  # type: ignore[import-untyped]
+        except ImportError:
+            self._show_error("OpenCV required for preview")
+            return False
+
+        segments: list[_CompositionSegment] = []
+        for clip in clips:
+            try:
+                video_path = self._service.get_clip_video_path(clip)
+            except ProjectServiceError:
+                continue
+            if not video_path.is_file():
+                continue
+            segment = self._build_segment(clip, video_path)
+            if segment is not None:
+                segments.append(segment)
+
+        if not segments:
+            self._show_error("No playable clips in composition")
+            return False
+
+        self._composition_mode = True
+        self._composition_segments = segments
+        self._composition_index = 0
+        self._clip_id = None
+        self._load_composition_segment(0)
+        self._set_controls_enabled(True)
+        self._set_composition_controls(True)
+        self.after_idle(self._rerender_last_frame)
+
+        if autoplay:
+            self._play()
+        elif self._on_status:
+            self._on_status(
+                f"Loaded composition ({len(segments)} clip"
+                f"{'' if len(segments) == 1 else 's'}) — press Play"
+            )
+        return True
+
+    def load_clip(self, clip_id: Optional[str], *, force: bool = False) -> None:
         """Load and show the first frame of a clip."""
         if clip_id is None or self._service is None:
             self.clear()
             return
-
-        if clip_id == self._clip_id and self._capture is not None:
-            return
-
-        self.stop_playback()
-        self._release_capture()
-        self._clip_id = clip_id
 
         try:
             clip = self._service.get_clip(clip_id)
@@ -169,6 +285,21 @@ class ClipPreviewPanel(ttk.LabelFrame):
         except ProjectServiceError:
             self.clear()
             return
+
+        if (
+            not force
+            and not self._composition_mode
+            and clip_id == self._clip_id
+            and self._capture is not None
+            and video_path == self._video_path
+        ):
+            return
+
+        self.stop_playback()
+        self._exit_composition_mode()
+        self._release_capture()
+        self._clip_id = clip_id
+        self._audio_enabled = audio_playback_available()
 
         if not video_path.is_file():
             self._show_error("Video file not found")
@@ -189,22 +320,26 @@ class ClipPreviewPanel(ttk.LabelFrame):
         resource = self._service.get_resource(clip.resource_id)
         capture_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         fps = normalize_fps(resource.fps, capture_fps)
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if frame_count <= 0 and resource.duration_frames > 0:
-            frame_count = resource.duration_frames
-        if frame_count <= 0:
-            frame_count = 1
+        trim_start, trim_end = clip_playback_trim(clip)
+        frame_count = resolve_playback_frame_count(
+            video_path,
+            trim_start_frame=trim_start,
+            trim_end_frame=trim_end,
+            resource_duration_frames=resource.duration_frames,
+        )
 
         self._capture = capture
         self._video_path = video_path
         self._fps = fps
         self._frame_count = frame_count
         self._current_frame = 0
+        self._trim_start_frame = trim_start or 0
         self._clip_name_var.set(clip.display_name)
         self._scrubber.configure(from_=0, to=max(frame_count - 1, 0))
         self._scrubber.set(0)
         self._frame_total_var.set(f"/ {frame_count}")
         self._set_controls_enabled(True)
+        self._set_composition_controls(False)
         self._show_frame(0)
         self.after_idle(self._rerender_last_frame)
 
@@ -229,7 +364,126 @@ class ClipPreviewPanel(ttk.LabelFrame):
     def _rerender_last_frame(self) -> None:
         self._resize_after_id = None
         if self._last_frame_bgr is not None:
-            self._render_frame(self._last_frame_bgr)
+            self._render_frame_bgr(self._last_frame_bgr)
+
+    def _exit_composition_mode(self) -> None:
+        self._composition_mode = False
+        self._composition_segments = []
+        self._composition_index = 0
+        self._set_composition_controls(False)
+
+    def _build_segment(self, clip, video_path: Path) -> Optional[_CompositionSegment]:
+        import cv2  # type: ignore[import-untyped]
+
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            capture.release()
+            return None
+
+        resource = self._service.get_resource(clip.resource_id)
+        capture_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        fps = normalize_fps(resource.fps, capture_fps)
+        trim_start, trim_end = clip_playback_trim(clip)
+        frame_count = resolve_playback_frame_count(
+            video_path,
+            trim_start_frame=trim_start,
+            trim_end_frame=trim_end,
+            resource_duration_frames=resource.duration_frames,
+        )
+        capture.release()
+
+        return _CompositionSegment(
+            clip_id=clip.id,
+            display_name=clip.display_name,
+            video_path=video_path,
+            fps=fps,
+            frame_count=frame_count,
+        )
+
+    def _load_composition_segment(self, index: int, show_first_frame: bool = True) -> None:
+        segment = self._composition_segments[index]
+        self._composition_index = index
+        self._release_capture()
+
+        import cv2  # type: ignore[import-untyped]
+
+        capture = cv2.VideoCapture(str(segment.video_path))
+        if not capture.isOpened():
+            capture.release()
+            return
+
+        self._capture = capture
+        self._video_path = segment.video_path
+        self._fps = segment.fps
+        self._frame_count = segment.frame_count
+        self._current_frame = 0
+        self._clip_id = segment.clip_id
+        self._update_composition_label()
+        self._scrubber.configure(from_=0, to=max(segment.frame_count - 1, 0))
+        self._scrubber.set(0)
+        self._frame_total_var.set(f"/ {segment.frame_count}")
+        if show_first_frame:
+            self._show_frame(0)
+
+    def _update_composition_label(self) -> None:
+        segment = self._composition_segments[self._composition_index]
+        total = len(self._composition_segments)
+        self._clip_name_var.set(
+            f"Composition {self._composition_index + 1}/{total} — {segment.display_name}"
+        )
+
+    def _set_composition_controls(self, composition: bool) -> None:
+        state = "disabled" if composition else "normal"
+        if self._capture is None and not composition:
+            state = "disabled"
+        self._scrubber.configure(state=state)
+        self._prev_frame_btn.configure(state=state)
+        self._next_frame_btn.configure(state=state)
+        self._frame_entry.configure(state=state)
+
+    def _advance_composition_segment(self) -> bool:
+        """Advance to the next clip in the composition."""
+        if not self._composition_mode:
+            return False
+        next_index = self._composition_index + 1
+        if next_index >= len(self._composition_segments):
+            return False
+        self._audio.stop()
+        self._load_composition_segment(next_index, show_first_frame=False)
+        return True
+
+    def _start_playback_audio(self, start_time: float) -> None:
+        if not self._audio_enabled or not self._playback_source_audio or self._video_path is None:
+            return
+        try:
+            self._audio.start(self._video_path, start_time)
+        except (ProjectServiceError, OSError):
+            if self._on_status:
+                self._on_status("Audio preview unavailable — playing video only.")
+
+    def _continue_composition_playback(self) -> None:
+        """Resume playback after switching to the next composition clip."""
+        if not self._playing or self._video_path is None:
+            return
+
+        generation = self._playback_generation
+        self._start_playback_audio(0.0)
+        self._play_with_opencv(generation)
+
+    def _finish_composition_playback(self) -> None:
+        if self._on_status:
+            self._on_status("Composition preview finished.")
+
+    def _end_playback(self) -> None:
+        """Stop at clip end; advance composition segments when applicable."""
+        if self._composition_mode and self._advance_composition_segment():
+            self._continue_composition_playback()
+            return
+        self._pause()
+        if self._composition_mode:
+            self._finish_composition_playback()
+        else:
+            self._notify_playback_finished()
 
     def toggle_play(self) -> None:
         """Start or pause playback."""
@@ -242,6 +496,12 @@ class ClipPreviewPanel(ttk.LabelFrame):
 
     def stop_playback(self) -> None:
         """Pause and return to the first frame."""
+        if self._composition_mode:
+            self._pause()
+            self._composition_index = 0
+            self._load_composition_segment(0)
+            return
+
         self._pause()
         if self._capture is not None:
             self._show_frame(0)
@@ -250,90 +510,58 @@ class ClipPreviewPanel(ttk.LabelFrame):
         """Pause playback without changing the current frame."""
         self._pause()
 
+    def release_media_handles(self) -> None:
+        """Stop playback/audio and close the open video file (needed before overwriting versions/)."""
+        self._pause()
+        self._audio.stop()
+        self._release_capture()
+        self._video_path = None
+
     def _play(self) -> None:
         if self._capture is None or self._frame_count <= 0 or self._video_path is None:
             return
-        if self._current_frame >= self._frame_count - 1:
+
+        if self._composition_mode:
+            at_last_segment = self._composition_index >= len(self._composition_segments) - 1
+            if at_last_segment and self._current_frame >= self._frame_count - 1:
+                self._composition_index = 0
+                self._load_composition_segment(0)
+        elif self._current_frame >= self._frame_count - 1:
             self._show_frame(0)
 
-        if self._audio_enabled:
-            start_time = self._current_frame / self._fps
-            try:
-                self._media.open(self._video_path, start_time)
-            except Exception:
-                self._audio_enabled = False
-                if self._on_status:
-                    self._on_status("Audio preview unavailable — playing video only.")
-                self._play_with_opencv()
-                return
-
-            self._playing = True
-            self._play_btn.configure(text="Pause")
-            self._playback_tick_media()
-            return
-
-        self._play_with_opencv()
-
-    def _play_with_opencv(self) -> None:
-        """Fallback playback without audio."""
+        self._cancel_playback_timer()
+        generation = self._bump_playback_generation()
         self._playing = True
         self._play_btn.configure(text="Pause")
+
+        start_time = (self._trim_start_frame + self._current_frame) / self._fps
+        self._start_playback_audio(start_time)
+        self._play_with_opencv(generation)
+
+    def _play_with_opencv(self, generation: int) -> None:
+        """Advance video frames on a wall-clock schedule."""
         frame_interval = 1.0 / self._fps
         self._next_frame_deadline = time.perf_counter() + frame_interval
-        self._playback_tick_opencv()
+        self._playback_tick_opencv(generation)
+
+    def _notify_playback_finished(self) -> None:
+        callback = self._on_playback_finished
+        self._on_playback_finished = None
+        self._playback_source_audio = True
+        if callback is not None and self.winfo_exists():
+            self.after(0, callback)
 
     def _pause(self) -> None:
         was_playing = self._playing
         self._playing = False
+        self._bump_playback_generation()
         self._play_btn.configure(text="Play")
-        if self._after_id is not None:
-            self.after_cancel(self._after_id)
-            self._after_id = None
-        self._media.close()
-        if was_playing and self._capture is not None:
-            self._show_frame(self._current_frame)
+        self._cancel_playback_timer()
+        self._audio.stop()
 
-    def _playback_tick_media(self) -> None:
-        """Advance playback with synced audio via ffpyplayer."""
-        if not self._playing or not self._media.is_open:
-            return
-
-        rgb, pts, status, delay = self._media.poll()
-        if status == "eof":
-            self._pause()
-            return
-
-        if status == "frame" and rgb is not None:
-            wait_ms = max(0, int(delay * 1000 + 0.5))
-            if wait_ms > 0:
-                self._after_id = self.after(
-                    wait_ms,
-                    lambda frame=rgb, presentation_time=pts: self._show_media_frame(
-                        frame, presentation_time
-                    ),
-                )
-                return
-            self._show_media_frame(rgb, pts)
-            return
-
-        wait_ms = max(1, int(delay * 1000 + 0.5)) if delay > 0 else 10
-        self._after_id = self.after(wait_ms, self._playback_tick_media)
-
-    def _show_media_frame(self, rgb, pts: float) -> None:
-        """Display one ffpyplayer frame, then request the next."""
-        if not self._playing or not self._media.is_open:
-            return
-
-        self._current_frame = min(int(pts * self._fps), self._frame_count - 1)
-        self._render_rgb(rgb)
-        if not self._scrubbing:
-            self._scrubber.set(self._current_frame)
-        self._sync_frame_entry(self._current_frame + 1)
-        self._playback_tick_media()
-
-    def _playback_tick_opencv(self) -> None:
+    def _playback_tick_opencv(self, generation: int) -> None:
         """Advance playback using wall-clock timing at the clip's frame rate."""
-        if not self._playing or self._capture is None:
+        if not self._playback_active(generation) or self._capture is None:
             return
 
         frame_interval = 1.0 / self._fps
@@ -341,10 +569,17 @@ class ClipPreviewPanel(ttk.LabelFrame):
 
         while self._playing and now >= self._next_frame_deadline:
             if self._current_frame >= self._frame_count - 1:
-                self._pause()
+                if self._composition_mode and self._advance_composition_segment():
+                    self._next_frame_deadline = time.perf_counter() + frame_interval
+                    now = time.perf_counter()
+                    continue
+                self._end_playback()
                 return
             if not self._advance_frame_sequential():
-                self._pause()
+                if self._current_frame >= self._frame_count - 1:
+                    self._end_playback()
+                else:
+                    self._pause()
                 return
             self._next_frame_deadline += frame_interval
             now = time.perf_counter()
@@ -354,18 +589,38 @@ class ClipPreviewPanel(ttk.LabelFrame):
                 self._next_frame_deadline = now + frame_interval
 
         wait_ms = max(1, int((self._next_frame_deadline - time.perf_counter()) * 1000))
-        self._after_id = self.after(wait_ms, self._playback_tick_opencv)
+        self._schedule_playback(
+            wait_ms,
+            lambda: self._playback_tick_opencv(generation),
+            generation=generation,
+        )
+
+    def _apply_frame_count(self, frame_count: int) -> None:
+        self._frame_count = max(frame_count, 1)
+        self._scrubber.configure(from_=0, to=max(self._frame_count - 1, 0))
+        self._frame_total_var.set(f"/ {self._frame_count}")
 
     def _advance_frame_sequential(self) -> bool:
         """Read and display the next frame without seeking (fast path for playback)."""
         if self._capture is None:
             return False
 
+        import cv2  # type: ignore[import-untyped]
+
+        next_index = self._current_frame + 1
         ok, frame = self._capture.read()
+        if not ok and next_index < self._frame_count:
+            self._capture.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                self._trim_start_frame + next_index,
+            )
+            ok, frame = self._capture.read()
         if not ok:
+            if next_index < self._frame_count:
+                self._apply_frame_count(next_index)
             return False
 
-        self._current_frame += 1
+        self._current_frame = next_index
         self._render_frame_bgr(frame)
         if not self._scrubbing:
             self._scrubber.set(self._current_frame)
@@ -379,7 +634,7 @@ class ClipPreviewPanel(ttk.LabelFrame):
         import cv2  # type: ignore[import-untyped]
 
         frame_index = max(0, min(frame_index, self._frame_count - 1))
-        self._capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        self._capture.set(cv2.CAP_PROP_POS_FRAMES, self._trim_start_frame + frame_index)
         ok, frame = self._capture.read()
         if not ok:
             self._show_error("Failed to read frame")
